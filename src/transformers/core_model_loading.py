@@ -906,16 +906,94 @@ class DtensorShardOperation:
                 param, self.param, sub_mesh, sub_mesh.get_local_rank(), placement.dim, tensor_idx=tensor_idx
             ).to(device=device, dtype=dtype)
 
-        # nD: materialize then split using each placement's _split_tensor,
-        # which correctly handles both contiguous Shard and interleaved _StridedShard.
-        # TODO(3outeille): make nD shard-on-read work without materializing the full tensor
-        tensor = param[...] if not isinstance(param, torch.Tensor) else param
+        # nD shard-on-read: precompute slice ranges for this rank and read only the
+        # needed pieces from safetensors, avoiding full-tensor materialization.
+        # Each placement contributes a list of (start, end) ranges on its shard dim.
+        # For Shard: one contiguous range. For _StridedShard: multiple disjoint ranges.
+        #
+        # Limitation: when a _StridedShard and another placement share the same dim,
+        # the strided reorder can't be composed via range arithmetic — fall back to
+        # materialize-then-split for that case.
+        dims_seen: dict[int, bool] = {}  # dim -> has_strided
+        can_shard_on_read = True
+        for _, placement in shard_dims:
+            dim = placement.dim
+            is_strided = not placement.is_shard()
+            if dim in dims_seen:
+                # Two placements on same dim — only composable if both are plain Shard
+                if is_strided or dims_seen[dim]:
+                    can_shard_on_read = False
+                    break
+            dims_seen[dim] = is_strided
+
+        if not can_shard_on_read:
+            tensor = param[...] if not isinstance(param, torch.Tensor) else param
+            for mesh_dim_idx, placement in shard_dims:
+                sub_mesh = self.device_mesh[self.device_mesh.mesh_dim_names[mesh_dim_idx]] if self.device_mesh.ndim > 1 else self.device_mesh
+                rank = sub_mesh.get_local_rank()
+                shards, _ = placement._split_tensor(tensor, sub_mesh.size(), with_padding=False, contiguous=True)
+                tensor = shards[rank]
+            return tensor.to(device=device, dtype=dtype)
+
+        # Compute per-dim ranges. Each dim is touched by at most one type of placement.
+        dim_range_lists: dict[int, list[tuple[int, int]]] = {}
         for mesh_dim_idx, placement in shard_dims:
             sub_mesh = self.device_mesh[self.device_mesh.mesh_dim_names[mesh_dim_idx]] if self.device_mesh.ndim > 1 else self.device_mesh
             rank = sub_mesh.get_local_rank()
-            shards, _ = placement._split_tensor(tensor, sub_mesh.size(), with_padding=False, contiguous=True)
-            tensor = shards[rank]
-        return tensor.to(device=device, dtype=dtype)
+            world_size = sub_mesh.size()
+            dim = placement.dim
+            prev_ranges = dim_range_lists.get(dim, [(0, param_shape[dim])])
+
+            new_ranges = []
+            if placement.is_shard():
+                # Contiguous Shard: one sub-range per previous range
+                for prev_start, prev_end in prev_ranges:
+                    size = prev_end - prev_start
+                    chunk = math.ceil(size / world_size)
+                    start = prev_start + rank * chunk
+                    end = min(start + chunk, prev_end)
+                    if start < prev_end:
+                        new_ranges.append((start, end))
+            else:
+                # _StridedShard: split_factor groups, each chunked by world_size, pick rank's piece from each
+                split_factor = placement.split_factor
+                for prev_start, prev_end in prev_ranges:
+                    size = prev_end - prev_start
+                    group_size = math.ceil(size / split_factor)
+                    for g in range(split_factor):
+                        g_start = prev_start + g * group_size
+                        g_end = min(g_start + group_size, prev_end)
+                        if g_end <= g_start:
+                            continue
+                        chunk = math.ceil((g_end - g_start) / world_size)
+                        start = g_start + rank * chunk
+                        end = min(start + chunk, g_end)
+                        if start < g_end:
+                            new_ranges.append((start, end))
+            dim_range_lists[dim] = new_ranges
+
+        # Build slices. At most one dim can have multiple disjoint ranges (_StridedShard).
+        concat_dim = None
+        concat_ranges = None
+        base_slices = [slice(None)] * len(param_shape)
+        for dim, ranges in dim_range_lists.items():
+            if len(ranges) == 1:
+                base_slices[dim] = slice(ranges[0][0], ranges[0][1])
+            elif len(ranges) > 1:
+                concat_dim = dim
+                concat_ranges = ranges
+
+        if concat_dim is None:
+            # All dims have single ranges — one slice read
+            return param[tuple(base_slices)].to(device=device, dtype=dtype)
+
+        # Read each disjoint range on the concat dim and concatenate
+        pieces = []
+        for start, end in concat_ranges:
+            slices = list(base_slices)
+            slices[concat_dim] = slice(start, end)
+            pieces.append(param[tuple(slices)])
+        return torch.cat(pieces, dim=concat_dim).to(device=device, dtype=dtype)
 
 
 @dataclass
