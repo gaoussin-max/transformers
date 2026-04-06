@@ -506,13 +506,18 @@ def save_fsdp_model(model, save_directory):
     model_sd = get_model_state_dict(model)
 
     # Clone tensors sharing storage (tied weights) — safetensors refuses aliased tensors
+    # Also ensure contiguity — the HF storage writer's memoryview consolidation
+    # requires contiguous tensors.
     seen_data_ptrs = {}
     for key in list(model_sd.keys()):
         tensor = model_sd[key]
         t = tensor._local_tensor if isinstance(tensor, DTensor) else tensor
         ptr = t.data_ptr()
         if ptr in seen_data_ptrs:
-            model_sd[key] = tensor.clone()
+            model_sd[key] = tensor.clone().contiguous()
+        elif not t.is_contiguous():
+            model_sd[key] = tensor.contiguous()
+            seen_data_ptrs[t.data_ptr()] = key
         else:
             seen_data_ptrs[ptr] = key
 

@@ -1215,7 +1215,6 @@ class ParallelInterface(GeneralInterface):
             "embedding_rowwise": RowwiseParallel(
                 input_layouts=Replicate(),
                 output_layouts=Shard(1),
-                use_local_output=False,
             ),
             "embedding_colwise": ColwiseParallel(
                 input_layouts=Shard(1),
@@ -1223,15 +1222,17 @@ class ParallelInterface(GeneralInterface):
             ),
             "colwise": ColwiseParallel(),
             "colwise_gather_output": ColwiseParallel(input_layouts=Shard(1), output_layouts=Replicate()),
-            "rowwise": RowwiseParallel(output_layouts=Shard(1), use_local_output=False),
+            "colwise_loss_parallel": ColwiseParallel(
+                input_layouts=Shard(1), output_layouts=Shard(-1), use_local_output=False,
+            ),
+            "rowwise": RowwiseParallel(output_layouts=Shard(1)),
             "sequence_parallel": SequenceParallel(),
-            "sequence_parallel_local_output": SequenceParallel(use_local_output=True),
-            "sequence_parallel_head_dim": SequenceParallel(sequence_dim=2, use_local_output=True),
-            "prepare_input_sp_to_replicate": PrepareModuleInput(
+            "sequence_parallel_head_dim_local_output": SequenceParallel(sequence_dim=2, use_local_output=True),
+            "prepare_attn_input_sequence_parallel": PrepareModuleInput(
                 input_kwarg_layouts={"hidden_states": Shard(1)},
                 desired_input_kwarg_layouts={"hidden_states": Replicate()},
             ),
-            "prepare_mlp_input_sp": PrepareModuleInput(
+            "prepare_mlp_input_sequence_parallel": PrepareModuleInput(
                 input_layouts=(Shard(1),),
                 desired_input_layouts=(Replicate(),),
             ),
@@ -1316,11 +1317,7 @@ def apply_tensor_parallel(model, tp_mesh, tp_plan):
         #TODO(3outeille): that means we won't know in advance when json.dump() what lm_head will have at sharding plan ??? 
         # Add lm_head if the model has one — style depends on SP mode and weight tying
         if hasattr(model, "lm_head"):
-            tie = getattr(model.config, "tie_word_embeddings", False)
-            if tie:
-                tp_plan["lm_head"] = "embedding_colwise"
-            else:
-                tp_plan["lm_head"] = "colwise_gather_output"
+            tp_plan["lm_head"] = "colwise_loss_parallel"
 
     parallelize_plan = {}
 
@@ -1338,6 +1335,7 @@ def apply_tensor_parallel(model, tp_mesh, tp_plan):
         parallelize_plan[name] = tp_style
 
     parallelize_module(model, tp_mesh, parallelize_plan)
+
 
     # Log modules that have parameters but were NOT parallelized.
     # With use_local_output=False, DTensors flow through the entire model,

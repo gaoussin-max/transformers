@@ -1,10 +1,13 @@
 # torchrun --nproc_per_node=4 train_fsdp_tp.py
 
+import argparse
+import contextlib
 import os
 
 import torch
 import torch.distributed.checkpoint as dcp
 from datasets import load_dataset
+from torch.distributed.tensor import DTensor
 from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.distributed import DistributedConfig
@@ -27,48 +30,89 @@ def build_packed_dataset(dataset_name, tokenizer, seq_len, dp_rank, dp_world_siz
     ds = ds.map(pack, batched=True, remove_columns=ds.column_names)
     return ds.with_format("torch")
 
+def build_fixed_batches(dp_rank):
+    """Load pre-generated fixed batches for a given DP rank."""
+    return torch.load(f"fixed_batches_dp{dp_rank}.pt", weights_only=True)
 
 if __name__ == "__main__":
 
-    model_name = "Qwen/Qwen3-0.6B"
-    dataset_name = "allenai/c4"
-    seq_len = 512
-    num_steps, lr = 50, 3e-4
-    batch_size = 4
-    save_dir = "./checkpoints"
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model_name", type=str, default="Qwen/Qwen3-0.6B")
+    parser.add_argument("--num_steps", type=int, default=20)
+    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--seq_len", type=int, default=512)
+    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--save_dir", type=str, default="./checkpoints")
+    parser.add_argument("--tp_size", type=int, default=0, help="Tensor parallel size (0 = disabled)")
+    parser.add_argument("--fsdp_size", type=int, default=0, help="FSDP size (0 = disabled)")
+    parser.add_argument("--enable_sp", action="store_true", help="Enable sequence parallelism")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--fixed_batches", action="store_true", help="Use pre-generated fixed batches instead of C4")
+    args = parser.parse_args()
 
     torch.distributed.init_process_group(backend="nccl")
     rank, local_rank = int(os.environ["RANK"]), int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
+    torch.manual_seed(args.seed)
 
-    distributed_config = DistributedConfig(tp_size=2, tp_plan="auto", fsdp_size=2, fsdp_plan="auto", enable_sequence_parallel=True)
-    # distributed_config = DistributedConfig(fsdp_size=4, fsdp_plan="auto")
-    # distributed_config = DistributedConfig(tp_size=4, tp_plan="auto", enable_sequence_parallel=True)
+    dc_kwargs = {}
+    if args.tp_size > 0:
+        dc_kwargs["tp_size"] = args.tp_size
+        dc_kwargs["tp_plan"] = "auto"
+    if args.fsdp_size > 0:
+        dc_kwargs["fsdp_size"] = args.fsdp_size
+        dc_kwargs["fsdp_plan"] = "auto"
+    if args.enable_sp:
+        dc_kwargs["enable_sequence_parallel"] = True
+    distributed_config = DistributedConfig(**dc_kwargs)
 
     model = AutoModelForCausalLM.from_pretrained(
-        model_name,
+        args.model_name,
         distributed_config=distributed_config,
         torch_dtype=torch.bfloat16,
     )
 
     dp_rank = model.device_mesh["fsdp"].get_local_rank() if "fsdp" in model.device_mesh.mesh_dim_names else 0
-    dp_world_size = model.device_mesh["fsdp"].size() if "fsdp" in model.device_mesh.mesh_dim_names else 1
-    
+    dp_size = model.device_mesh["fsdp"].size() if "fsdp" in model.device_mesh.mesh_dim_names else 1
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    dataset = build_packed_dataset(dataset_name, tokenizer, seq_len, dp_rank, dp_world_size)
-    dataloader = DataLoader(dataset, batch_size=batch_size)
+    if args.fixed_batches:
+        fixed = build_fixed_batches(dp_rank)
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        dataset = build_packed_dataset("allenai/c4", tokenizer, args.seq_len, dp_rank, dp_size)
+        dataloader = iter(DataLoader(dataset, batch_size=args.batch_size))
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+    # Enable loss_parallel when TP is active (wraps forward+backward)
+    enable_loss_parallel = args.tp_size > 0
+    if enable_loss_parallel:
+        from torch.distributed.tensor.parallel import loss_parallel
+        train_context = loss_parallel
+    else:
+        train_context = contextlib.nullcontext
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     model.train()
-    data_iterator = iter(dataloader)
-    for step in range(num_steps):
-        batch = next(data_iterator)
-        input_ids = batch["input_ids"].to(f"cuda:{local_rank}")
-        labels = batch["labels"].to(f"cuda:{local_rank}")
+    for step in range(args.num_steps):
+        if args.fixed_batches:
+            input_ids = fixed[step]["input_ids"].to(f"cuda:{local_rank}")
+            labels = fixed[step]["labels"].to(f"cuda:{local_rank}")
+        else:
+            batch = next(dataloader)
+            input_ids = batch["input_ids"].to(f"cuda:{local_rank}")
+            labels = batch["labels"].to(f"cuda:{local_rank}")
+        position_ids = torch.arange(input_ids.shape[1], device=input_ids.device).unsqueeze(0)
 
-        loss = model(input_ids, labels=labels).loss
-        loss.backward()
+        with train_context():
+            logits = model(input_ids, position_ids=position_ids).logits
+            loss = torch.nn.functional.cross_entropy(
+                logits.flatten(0, 1).float(),
+                labels.flatten(0, 1),
+                reduction="mean",
+            )
+            loss.backward()
+
         grad_norm = dist_utils.clip_grad_norm_(list(model.parameters()), max_norm=1.0, foreach=True)
         optimizer.step()
         optimizer.zero_grad()
@@ -77,10 +121,10 @@ if __name__ == "__main__":
             print(f"Step {step:>4d} | Loss: {loss.item():.4f} | Grad norm: {grad_norm.item():.4f}")
 
     # Save model (HF format) and optimizer (DCP)
-    model.save_pretrained(save_dir)
-    dcp.save({"optimizer": optimizer.state_dict()}, checkpoint_id=os.path.join(save_dir, "optimizer"))
+    model.save_pretrained(args.save_dir)
+    dcp.save({"optimizer": optimizer.state_dict()}, checkpoint_id=os.path.join(args.save_dir, "optimizer"))
 
     if rank == 0:
-        print(f"Saved to {save_dir}")
+        print(f"Saved to {args.save_dir}")
 
     torch.distributed.destroy_process_group()

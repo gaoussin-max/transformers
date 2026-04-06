@@ -98,4 +98,15 @@ def init_device_mesh(distributed_config: DistributedConfig) -> torch.distributed
         dims.append(tp_size)
         names.append("tp")
 
-    return torch.distributed.init_device_mesh(device_type, tuple(dims), mesh_dim_names=tuple(names))
+    # Build from a 1D world mesh via _unflatten so that PyTorch can flatten
+    # sub-dimensions back when needed (e.g. for single all_reduce across
+    # [fsdp, tp] during grad norm computation instead of 2 sequential ones).
+    world_mesh = torch.distributed.init_device_mesh(device_type, (world_size,), mesh_dim_names=("world",))
+    mesh = world_mesh._unflatten(0, tuple(dims), tuple(names))
+
+    # Pre-create flattened sub-mesh for multi-dimensional meshes so DTensor
+    # can use a single collective instead of sequential per-dimension ones.
+    if len(dims) > 1:
+        mesh._flatten("_".join(names))
+
+    return mesh
