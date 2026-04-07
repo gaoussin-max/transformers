@@ -32,7 +32,6 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from .integrations.accelerate import get_device, offload_weight
-from .integrations.tensor_parallel import ALL_PARALLEL_STYLES, get_tensor_shard
 from .utils import is_env_variable_true
 from .utils.loading_report import LoadStateDictInfo
 from .utils.logging import get_logger, tqdm
@@ -46,6 +45,7 @@ if TYPE_CHECKING:
 elif _torch_distributed_available:
     from torch.distributed.tensor import DTensor
     from torch.distributed.tensor._utils import compute_local_shape_and_global_offset
+    from torch.distributed.tensor.placement_types import Shard
 
 
 logger = get_logger(__name__)
@@ -858,125 +858,151 @@ def spawn_parallel_materialize(
         return _job
 
 
-
 class DtensorShardOperation:
     """Extracts the local shard from a full checkpoint tensor based on this rank's DTensor placements."""
-
-    __slots__ = ("device_mesh", "param", "placements", "local_shape")
+    # tensor_dim -> list of (start, end) index ranges this rank owns
+    DimRanges = dict[int, list[tuple[int, int]]]
 
     def __init__(self, param: DTensor):
         self.device_mesh = param.device_mesh
         self.param = param
         self.placements = tuple(param.placements)
-        self.local_shape, _ = compute_local_shape_and_global_offset(
-            param.shape, self.device_mesh, self.placements
-        )
-        self.local_shape = tuple(self.local_shape)
+        local_shape, _ = compute_local_shape_and_global_offset(param.shape, self.device_mesh, self.placements)
+        self.local_shape = tuple(local_shape)
 
     def shard_tensor(
         self, param: torch.Tensor, tensor_idx: int | None = None, device=None, dtype=None
     ) -> torch.Tensor | None:
-        # Find which mesh dimensions shard data.
-        # Note: _StridedShard.is_shard() returns False in PyTorch, so we also
-        # check for the ``dim`` attribute that both Shard and _StridedShard have.
-        shard_dims = [
-            (i, p) for i, p in enumerate(self.placements)
+        """Return the local shard of ``param`` for this rank, dispatching to the appropriate strategy."""
+        # Find which placements actually shard data.
+        # _StridedShard.is_shard() returns False in PyTorch, so we also check for
+        # the ``dim`` attribute that both Shard and _StridedShard have.
+        sharding_placements = [
+            (i, p)
+            for i, p in enumerate(self.placements)
             if p.is_shard() or (hasattr(p, "dim") and not p.is_replicate())
         ]
+        param_shape = list(param.shape) if isinstance(param, torch.Tensor) else param.get_shape()
 
-        if not shard_dims:
+        if not sharding_placements:
             return param[...].to(device=device, dtype=dtype)
 
-        # Mixtral-style experts: individual tensors arrive one at a time.
-        # Skip experts not owned by this rank.
-        param_shape = list(param.shape) if isinstance(param, torch.Tensor) else param.get_shape()
         if tensor_idx is not None and len(self.param.shape) == len(param_shape) + 1:
-            _, offsets = compute_local_shape_and_global_offset(
+            return self._shard_expert(param, tensor_idx, device, dtype)
+
+        return self._shard_nd(param, sharding_placements, param_shape, device, dtype)
+
+    def _shard_expert(self, param, tensor_idx, device, dtype):
+        """Handle MoE experts that arrive one tensor at a time.
+
+        The DTensor parameter has an extra leading dimension stacking all experts.
+        Skip experts not owned by this rank; return the full expert otherwise.
+        """
+        _, offsets = compute_local_shape_and_global_offset(
+            self.param.shape, self.device_mesh, self.placements
+        )
+        if tensor_idx < offsets[0] or tensor_idx >= offsets[0] + self.local_shape[0]:
+            return None
+        return param[...].to(device=device, dtype=dtype)
+
+    def _shard_nd(self, param, sharding_placements, param_shape, device, dtype):
+        """Handle multi-dimensional sharding, choosing the best strategy."""
+        if not self._can_shard_on_read(sharding_placements):
+            return self._materialize_and_split(param, sharding_placements, device, dtype)
+
+        # All placements are plain Shard on different dims.
+        # compute_local_shape_and_global_offset gives us one contiguous range per dim directly.
+        has_strided = any(not p.is_shard() for _, p in sharding_placements)
+        if not has_strided:
+            local_shape, global_offset = compute_local_shape_and_global_offset(
                 self.param.shape, self.device_mesh, self.placements
             )
-            if tensor_idx < offsets[0] or tensor_idx >= offsets[0] + self.local_shape[0]:
-                return None
-            return param[...].to(device=device, dtype=dtype)
+            slices = [slice(None)] * len(param_shape)
+            for _, placement in sharding_placements:
+                # Adjust dim when DTensor has more dims than checkpoint tensor (e.g. MoE 3D vs 2D)
+                dim = placement.dim
+                if dim < 0:
+                    dim = len(param_shape) + dim
+                ndim_diff = self.param.ndim - len(param_shape)
+                if ndim_diff > 0 and dim >= ndim_diff:
+                    dim -= ndim_diff
+                offset = global_offset[placement.dim]
+                slices[dim] = slice(offset, offset + local_shape[placement.dim])
+            return param[tuple(slices)].to(device=device, dtype=dtype)
 
-        # 1D: shard-on-read — slice directly from safetensors without materializing the full tensor
-        if len(shard_dims) == 1:
-            mesh_dim_idx, placement = shard_dims[0]
-            sub_mesh = self.device_mesh[self.device_mesh.mesh_dim_names[mesh_dim_idx]] if self.device_mesh.ndim > 1 else self.device_mesh
-            return get_tensor_shard(
-                param, self.param, sub_mesh, sub_mesh.get_local_rank(), placement.dim, tensor_idx=tensor_idx
-            ).to(device=device, dtype=dtype)
+        dim_ranges = self._compute_dim_ranges(sharding_placements, param_shape)
+        return self._slice_and_read(param, param_shape, dim_ranges, device, dtype)
 
-        # nD shard-on-read: precompute slice ranges for this rank and read only the
-        # needed pieces from safetensors, avoiding full-tensor materialization.
-        # Each placement contributes a list of (start, end) ranges on its shard dim.
-        # For Shard: one contiguous range. For _StridedShard: multiple disjoint ranges.
-        #
-        # Limitation: when a _StridedShard and another placement share the same dim,
-        # the strided reorder can't be composed via range arithmetic — fall back to
-        # materialize-then-split for that case.
+    def _can_shard_on_read(self, sharding_placements) -> bool:
+        """Check whether range-based shard-on-read is feasible.
+
+        Returns ``False`` when a ``_StridedShard`` and another placement share the
+        same tensor dimension — the strided reorder can't be composed via range
+        arithmetic because ``Shard`` would need to cut across the concatenated
+        result of ``_StridedShard``'s disjoint ranges.
+        """
         dims_seen: dict[int, bool] = {}  # dim -> has_strided
-        can_shard_on_read = True
-        for _, placement in shard_dims:
+        for _, placement in sharding_placements:
             dim = placement.dim
             is_strided = not placement.is_shard()
-            if dim in dims_seen:
-                # Two placements on same dim — only composable if both are plain Shard
-                if is_strided or dims_seen[dim]:
-                    can_shard_on_read = False
-                    break
+            if dim in dims_seen and (is_strided or dims_seen[dim]):
+                logger.debug(
+                    "Cannot shard-on-read: dim %d has both Shard and _StridedShard placements, "
+                    "falling back to materialize-then-split.",
+                    dim,
+                )
+                return False
             dims_seen[dim] = is_strided
+        return True
 
-        if not can_shard_on_read:
-            tensor = param[...] if not isinstance(param, torch.Tensor) else param
-            for mesh_dim_idx, placement in shard_dims:
-                sub_mesh = self.device_mesh[self.device_mesh.mesh_dim_names[mesh_dim_idx]] if self.device_mesh.ndim > 1 else self.device_mesh
-                rank = sub_mesh.get_local_rank()
-                shards, _ = placement._split_tensor(tensor, sub_mesh.size(), with_padding=False, contiguous=True)
-                tensor = shards[rank]
-            return tensor.to(device=device, dtype=dtype)
+    def _materialize_and_split(self, param, sharding_placements, device, dtype):
+        """Fallback: load the full tensor, then iteratively split per mesh dim."""
+        tensor = param[...] if not isinstance(param, torch.Tensor) else param
+        for mesh_dim_idx, placement in sharding_placements:
+            sub_mesh = self._get_sub_mesh(mesh_dim_idx)
+            rank = sub_mesh.get_local_rank()
+            shards, _ = placement._split_tensor(tensor, sub_mesh.size(), with_padding=False, contiguous=True)
+            tensor = shards[rank]
+        return tensor.to(device=device, dtype=dtype)
 
-        # Compute per-dim ranges. Each dim is touched by at most one type of placement.
-        dim_range_lists: dict[int, list[tuple[int, int]]] = {}
-        for mesh_dim_idx, placement in shard_dims:
-            sub_mesh = self.device_mesh[self.device_mesh.mesh_dim_names[mesh_dim_idx]] if self.device_mesh.ndim > 1 else self.device_mesh
+    def _compute_dim_ranges(self, sharding_placements, param_shape) -> DimRanges:
+        """Compute per-dimension index ranges for this rank.
+
+        Each sharding placement narrows the ranges on its tensor dimension:
+        - ``Shard``: one contiguous sub-range per previous range.
+        - ``_StridedShard``: multiple disjoint sub-ranges (one per split-factor group).
+        """
+        dim_ranges: DimRanges = {}
+        for mesh_dim_idx, placement in sharding_placements:
+            sub_mesh = self._get_sub_mesh(mesh_dim_idx)
             rank = sub_mesh.get_local_rank()
             world_size = sub_mesh.size()
+            # Adjust dim when DTensor has more dims than checkpoint tensor (e.g. MoE 3D vs 2D)
             dim = placement.dim
-            prev_ranges = dim_range_lists.get(dim, [(0, param_shape[dim])])
+            if dim < 0:
+                dim = len(param_shape) + dim
+            ndim_diff = self.param.ndim - len(param_shape)
+            if ndim_diff > 0 and dim >= ndim_diff:
+                dim -= ndim_diff
+            prev_ranges = dim_ranges.get(dim, [(0, param_shape[dim])])
 
-            new_ranges = []
             if placement.is_shard():
-                # Contiguous Shard: one sub-range per previous range
-                for prev_start, prev_end in prev_ranges:
-                    size = prev_end - prev_start
-                    chunk = math.ceil(size / world_size)
-                    start = prev_start + rank * chunk
-                    end = min(start + chunk, prev_end)
-                    if start < prev_end:
-                        new_ranges.append((start, end))
+                new_ranges = self._contiguous_ranges(prev_ranges, rank, world_size)
             else:
-                # _StridedShard: split_factor groups, each chunked by world_size, pick rank's piece from each
-                split_factor = placement.split_factor
-                for prev_start, prev_end in prev_ranges:
-                    size = prev_end - prev_start
-                    group_size = math.ceil(size / split_factor)
-                    for g in range(split_factor):
-                        g_start = prev_start + g * group_size
-                        g_end = min(g_start + group_size, prev_end)
-                        if g_end <= g_start:
-                            continue
-                        chunk = math.ceil((g_end - g_start) / world_size)
-                        start = g_start + rank * chunk
-                        end = min(start + chunk, g_end)
-                        if start < g_end:
-                            new_ranges.append((start, end))
-            dim_range_lists[dim] = new_ranges
+                new_ranges = self._strided_ranges(prev_ranges, rank, world_size, placement.split_factor)
+            dim_ranges[dim] = new_ranges
+        return dim_ranges
 
-        # Build slices. At most one dim can have multiple disjoint ranges (_StridedShard).
+    def _slice_and_read(self, param, param_shape, dim_ranges: DimRanges, device, dtype):
+        """Build slices from computed ranges and read from the tensor.
+
+        At most one dim can have multiple disjoint ranges (from ``_StridedShard``).
+        If so, read each disjoint range separately and concatenate.
+        """
         concat_dim = None
         concat_ranges = None
         base_slices = [slice(None)] * len(param_shape)
-        for dim, ranges in dim_range_lists.items():
+        for dim, ranges in dim_ranges.items():
             if len(ranges) == 1:
                 base_slices[dim] = slice(ranges[0][0], ranges[0][1])
             elif len(ranges) > 1:
@@ -984,10 +1010,8 @@ class DtensorShardOperation:
                 concat_ranges = ranges
 
         if concat_dim is None:
-            # All dims have single ranges — one slice read
             return param[tuple(base_slices)].to(device=device, dtype=dtype)
 
-        # Read each disjoint range on the concat dim and concatenate
         pieces = []
         for start, end in concat_ranges:
             slices = list(base_slices)
@@ -995,6 +1019,51 @@ class DtensorShardOperation:
             pieces.append(param[tuple(slices)])
         return torch.cat(pieces, dim=concat_dim).to(device=device, dtype=dtype)
 
+    # ------------------------------------------------------------------
+    # Utilities
+    # ------------------------------------------------------------------
+
+    def _contiguous_ranges(
+        self, prev_ranges: list[tuple[int, int]], rank: int, world_size: int
+    ) -> list[tuple[int, int]]:
+        """Narrow each range by picking the ``rank``-th contiguous chunk (``Shard`` semantics)."""
+        new_ranges = []
+        for prev_start, prev_end in prev_ranges:
+            shard_size, offset = Shard.local_shard_size_and_offset(
+                prev_end - prev_start, world_size, rank
+            )
+            if shard_size > 0:
+                new_ranges.append((prev_start + offset, prev_start + offset + shard_size))
+        return new_ranges
+
+    def _strided_ranges(
+        self, prev_ranges: list[tuple[int, int]], rank: int, world_size: int, split_factor: int
+    ) -> list[tuple[int, int]]:
+        """Narrow each range using ``_StridedShard`` semantics.
+
+        Divides each range into ``split_factor`` groups, then within each group
+        picks the ``rank``-th chunk of ``world_size`` equal pieces.
+        """
+        new_ranges = []
+        for prev_start, prev_end in prev_ranges:
+            group_size = math.ceil((prev_end - prev_start) / split_factor)
+            for g in range(split_factor):
+                g_start = prev_start + g * group_size
+                g_end = min(g_start + group_size, prev_end)
+                if g_end <= g_start:
+                    continue
+                shard_size, offset = Shard.local_shard_size_and_offset(
+                    g_end - g_start, world_size, rank
+                )
+                if shard_size > 0:
+                    new_ranges.append((g_start + offset, g_start + offset + shard_size))
+        return new_ranges
+
+    def _get_sub_mesh(self, mesh_dim_idx: int):
+        """Return the 1-D sub-mesh for ``mesh_dim_idx``."""
+        if self.device_mesh.ndim > 1:
+            return self.device_mesh[self.device_mesh.mesh_dim_names[mesh_dim_idx]]
+        return self.device_mesh
 
 @dataclass
 class ParallelMaterializationContext:
