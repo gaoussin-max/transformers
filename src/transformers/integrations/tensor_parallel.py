@@ -1270,15 +1270,12 @@ def apply_tensor_parallel(model, tp_mesh, tp_plan):
             base_plan = model.config.base_model_tp_plan or {}
 
         # Prefix base model keys (e.g. "layers.*.q_proj" → "model.layers.*.q_proj")
+        # Top-level keys like "lm_head" are kept as-is.
         base_model_prefix = model.base_model_prefix
-        tp_plan = {f"{base_model_prefix}.{k}": v for k, v in base_plan.items()}
-
-        # Add lm_head if the model has one — style depends on SP mode
-        if hasattr(model, "lm_head"):
-            if enable_sp:
-                tp_plan["lm_head"] = TPStyle("colwise", "loss_parallel")
-            else:
-                tp_plan["lm_head"] = TPStyle("colwise", "allgather")
+        tp_plan = {}
+        for k, v in base_plan.items():
+            is_top_level = hasattr(model, k.split(".")[0])
+            tp_plan[k if is_top_level else f"{base_model_prefix}.{k}"] = v
 
     parallelize_plan = {}
 
