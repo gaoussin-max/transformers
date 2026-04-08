@@ -1177,7 +1177,17 @@ def verify_tp_plan(expected_keys: list[str], tp_plan: dict[str, str] | None):
     if len(unsharded_layers) > 0:
         logger.warning(f"The following layers were not sharded: {', '.join(unsharded_layers)}")
 
-# ===== NEW FILE ===
+
+# Legacy placeholder — referenced by old hooks-based functions (gather_state_dict_for_save, etc.)
+ALL_PARALLEL_STYLES = GeneralInterface()
+
+
+# =============================================================================
+# TPStyle: user-facing API for specifying tensor parallelism
+# =============================================================================
+
+from dataclasses import dataclass
+from typing import Literal
 
 from torch.distributed.tensor import Replicate, Shard
 from torch.distributed.tensor.parallel import (
@@ -1188,118 +1198,66 @@ from torch.distributed.tensor.parallel import (
     parallelize_module,
 )
 from torch.distributed.tensor.parallel.style import ParallelStyle
-from torch.distributed.tensor._api import distribute_module
 
 
-class ParallelInterface(GeneralInterface):
-    # Class instance object, so that a call to `register` can be reflected into all other files correctly, even if
-    # a new instance is created (in order to locally override a given entry)
-    _global_mapping = (
-        {
-            # "embedding_rowwise_hf": EmbeddingParallelHF(embedding_dim_sharding=0),
-            # "embedding_colwise_hf": EmbeddingParallelHF(embedding_dim_sharding=1),
-            # "colwise_gather_output_hf": ColwiseParallelHF(gather_output=True),
-            # "colwise_hf": ColwiseParallelHF(),
-            # "rowwise_hf": RowwiseParallelHF(),
-            # "rowwise_split_input_hf": RowwiseParallelHF(split_input=True),
-            # "packed_colwise_hf": PackedColwiseParallelHF(),
-            # "packed_rowwise_hf": PackedRowwiseParallelHF(),
-            # "sequence_parallel": SequenceParallelHF(),
-            # "grouped_gemm_hf": GroupedGemmParallelHF(),
-            # "ep_router": RouterParallelHF(),
-            # "moe_tp_experts_hf": MoeTensorParalellExpertsHF(),
-            # "moe_identity_expert_hf": MoeIdentityExpertParallelHF(),
-            # "replicated_with_grad_allreduce_hf": ReplicatedWithGradAllReduceHF(),
-            # "mla_kv_a_proj_hf": MlaKvAProjParallelHF(),
-            # ==== DTensor styles with Sequence Parallelism (training) ====
-            "embedding_rowwise": RowwiseParallel(
-                input_layouts=Replicate(),
-                output_layouts=Shard(1),
-            ),
-            "embedding_colwise": ColwiseParallel(
-                input_layouts=Shard(1),
-                output_layouts=Replicate(),
-            ),
-            "colwise": ColwiseParallel(),
-            "colwise_gather_output": ColwiseParallel(input_layouts=Shard(1), output_layouts=Replicate()),
-            "colwise_loss_parallel": ColwiseParallel(
-                input_layouts=Shard(1), output_layouts=Shard(-1), use_local_output=False,
-            ),
-            "rowwise": RowwiseParallel(output_layouts=Shard(1)),
-            "sequence_parallel": SequenceParallel(),
-            "sequence_parallel_head_dim_local_output": SequenceParallel(sequence_dim=2, use_local_output=True),
-            "prepare_attn_input_sequence_parallel": PrepareModuleInput(
-                input_kwarg_layouts={"hidden_states": Shard(1)},
-                desired_input_kwarg_layouts={"hidden_states": Replicate()},
-            ),
-            "prepare_mlp_input_sequence_parallel": PrepareModuleInput(
-                input_layouts=(Shard(1),),
-                desired_input_layouts=(Replicate(),),
-            ),
-            # ==== DTensor styles without SP (inference) ====
-            # All activations are plain tensors. Compatible with any seq_len and KV cache.
-            "embedding_rowwise_inference": RowwiseParallel(
-                input_layouts=Replicate(),
-                output_layouts=Replicate(),
-            ),
-            "rowwise_inference": RowwiseParallel(output_layouts=Replicate()),
-        }
-        if is_torch_available() and _torch_distributed_available
-        else {}
-    )
+@dataclass(frozen=True)
+class TPStyle:
+    kind: Literal["colwise", "rowwise", "vocab", "activation", "module"]
+    comm: Literal["none", "allreduce", "reduce_scatter", "allgather", "loss_parallel"]
+    sequence_dim: int = 1
+    use_local_output: bool = True
+    input_key: str | None = None
 
-    # # Map plan names to sharding dimensions for weights
-    # # For weights: colwise shards dim -2, rowwise shards dim -1
-    # # For embedding: rowwise shards dim 0 (vocab), colwise shards dim -2 (hidden)
-    # plan_to_weight_dim: dict[str, int | None] = {
-    #     "colwise": -2,
-    #     "colwise_gather_output": -2,
-    #     "packed_colwise": -2,
-    #     "rowwise": -1,
-    #     "rowwise_split_input": -1,
-    #     "packed_rowwise": -1,
-    #     "embedding_rowwise": 0,
-    #     "embedding_colwise": 1,
-    #     "sequence_parallel": None,
-    #     "replicated_with_grad_allreduce": None,
-    #     "replicate": None,
-    #     "mla_kv_a_proj": None,
-    # }
+    def to_dtensor_style(self) -> ParallelStyle:
+        """Convert to the corresponding PyTorch DTensor ParallelStyle."""
+        if self.kind == "colwise":
+            match self.comm:
+                case "none":          return ColwiseParallel(input_layouts=Replicate(), output_layouts=Shard(-1), use_local_output=self.use_local_output)
+                case "allgather":     return ColwiseParallel(input_layouts=Replicate(), output_layouts=Replicate(), use_local_output=self.use_local_output)
+                case "loss_parallel": return ColwiseParallel(input_layouts=Shard(1), output_layouts=Shard(-1), use_local_output=False)
+        elif self.kind == "rowwise":
+            match self.comm:
+                case "allreduce":      return RowwiseParallel(input_layouts=Shard(-1), output_layouts=Replicate(), use_local_output=self.use_local_output)
+                case "reduce_scatter": return RowwiseParallel(input_layouts=Shard(-1), output_layouts=Shard(1), use_local_output=self.use_local_output)
+        elif self.kind == "vocab":
+            match self.comm:
+                case "allreduce":      return RowwiseParallel(input_layouts=Replicate(), output_layouts=Replicate(), use_local_output=self.use_local_output)
+                case "reduce_scatter": return RowwiseParallel(input_layouts=Replicate(), output_layouts=Shard(1), use_local_output=self.use_local_output)
+        elif self.kind == "activation":
+            match self.comm:
+                case "none": return SequenceParallel(sequence_dim=self.sequence_dim, use_local_output=self.use_local_output)
+        elif self.kind == "module":
+            match self.comm:
+                case "allgather":
+                    if self.input_key is not None:
+                        return PrepareModuleInput(
+                            input_kwarg_layouts={self.input_key: Shard(1)},
+                            desired_input_kwarg_layouts={self.input_key: Replicate()},
+                        )
+                    return PrepareModuleInput(
+                        input_layouts=(Shard(1),),
+                        desired_input_layouts=(Replicate(),),
+                    )
+        raise ValueError(
+            f"Invalid TPStyle({self.kind!r}, {self.comm!r}). Valid combinations:\n"
+            f"  colwise:    none, allgather, loss_parallel\n"
+            f"  rowwise:    allreduce, reduce_scatter\n"
+            f"  vocab:      allreduce, reduce_scatter\n"
+            f"  activation: none\n"
+            f"  module:     allgather"
+        )
 
-    # # Bias sharding: colwise shards bias, rowwise doesn't (bias is replicated and all-reduced)
-    # plan_to_bias_dim: dict[str, int | None] = {
-    #     "colwise": -1,
-    #     "colwise_gather_output": -1,
-    #     "packed_colwise": -1,
-    #     "rowwise": None,
-    #     "rowwise_split_input": None,
-    #     "packed_rowwise": None,
-    #     "embedding_rowwise": None,
-    #     "embedding_colwise": None,
-    #     "sequence_parallel": None,
-    #     "replicated_with_grad_allreduce": None,
-    #     "replicate": None,
-    #     "mla_kv_a_proj": None,
-    # }
-
-    # @classmethod
-    # def register_plan_to_weight_dim(cls, key: str, value: int | None):
-    #     cls.plan_to_weight_dim[key] = value
-
-    # @classmethod
-    # def register_plan_to_bias_dim(cls, key: str, value: int | None):
-    #     cls.plan_to_bias_dim[key] = value
-
-
-ALL_PARALLEL_STYLES: ParallelInterface = ParallelInterface()
+    def __str__(self):
+        if self.comm == "none":
+            return self.kind
+        return f"{self.kind}_{self.comm}"
 
 
 def apply_tensor_parallel(model, tp_mesh, tp_plan):
     """Apply tensor parallelism using PyTorch's parallelize_module.
 
-    Converts the wildcard tp_plan from model config
-    (e.g. ``{"model.layers.*.self_attn.q_proj": "colwise"}``)
-    into a concrete plan for ``parallelize_module``.
+    Converts the wildcard tp_plan from model config into a concrete plan
+    for ``parallelize_module``. Plan values is a `TPStyle`` instances
     """
     if tp_plan is None:
         return model
@@ -1314,42 +1272,23 @@ def apply_tensor_parallel(model, tp_mesh, tp_plan):
         # Prefix base model keys (e.g. "layers.*.q_proj" → "model.layers.*.q_proj")
         base_model_prefix = model.base_model_prefix
         tp_plan = {f"{base_model_prefix}.{k}": v for k, v in base_plan.items()}
-        #TODO(3outeille): that means we won't know in advance when json.dump() what lm_head will have at sharding plan ??? 
-        # Add lm_head if the model has one — style depends on SP mode and weight tying
+
+        # Add lm_head if the model has one — style depends on SP mode
         if hasattr(model, "lm_head"):
-            tp_plan["lm_head"] = "colwise_loss_parallel"
+            if enable_sp:
+                tp_plan["lm_head"] = TPStyle("colwise", "loss_parallel")
+            else:
+                tp_plan["lm_head"] = TPStyle("colwise", "allgather")
 
     parallelize_plan = {}
 
     for name, _ in model.named_modules():
-        tp_style_name = _get_parameter_tp_plan(parameter_name=name, tp_plan=tp_plan, is_weight=False)
-        if tp_style_name is None:
+        style_value = _get_parameter_tp_plan(parameter_name=name, tp_plan=tp_plan, is_weight=False)
+        if style_value is None:
             continue
-        tp_style = ALL_PARALLEL_STYLES.get(tp_style_name)
-        if tp_style is None:
-            logger.warning_once(
-                f"TP style '{tp_style_name}' for module '{name}' is not yet supported in DTensor mode. "
-                "This module will not be parallelized."
-            )
-            continue
-        parallelize_plan[name] = tp_style
+
+        parallelize_plan[name] = style_value.to_dtensor_style()
 
     parallelize_module(model, tp_mesh, parallelize_plan)
-
-
-    # Log modules that have parameters but were NOT parallelized.
-    # With use_local_output=False, DTensors flow through the entire model,
-    # so any module with plain tensor weights will crash on mixed tensor ops.
-    unparallelized = []
-    for name, mod in model.named_modules():
-        has_own_params = any(True for _ in mod.parameters(recurse=False))
-        if has_own_params and name not in parallelize_plan:
-            unparallelized.append(name)
-    if unparallelized:
-        logger.warning_once(
-            f"The following modules have parameters but are NOT in the TP plan "
-            f"(their weights are plain tensors, not DTensors). This will cause errors "
-            f"if they receive DTensor inputs: {unparallelized}"
-        )
 
     return model
