@@ -72,16 +72,17 @@ logger = logging.getLogger(__name__)
 def list_field(default=None, metadata=None):
     return field(default_factory=lambda: default, metadata=metadata)
 
+ignore_mismatched_sizes: bool = field(
+  default=False,
+  metadata={"help": "Whether or not to enable to load a pretrained model whose head dimensions are different."},
+)
 
 @dataclass
 class ModelArguments:
     """
     Arguments pertaining to which model/config/tokenizer we are going to fine-tune from.
     """
-    ignore_mismatched_sizes: bool = field(
-    default=False,
-    metadata={"help": "Whether or not to enable to load a pretrained model whose head dimensions are different."},
-    )
+
 
 
     model_name_or_path: str = field(
