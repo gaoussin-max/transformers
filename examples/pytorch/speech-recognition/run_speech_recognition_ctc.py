@@ -78,6 +78,11 @@ class ModelArguments:
     """
     Arguments pertaining to which model/config/tokenizer we are going to fine-tune from.
     """
+    ignore_mismatched_sizes: bool = field(
+    default=False,
+    metadata={"help": "Whether or not to enable to load a pretrained model whose head dimensions are different."},
+    )
+
 
     model_name_or_path: str = field(
         metadata={"help": "Path to pretrained model or model identifier from huggingface.co/models"}
@@ -611,13 +616,24 @@ def main():
     )
 
     # create model
+#     model = AutoModelForCTC.from_pretrained(
+#         model_args.model_name_or_path,
+#         cache_dir=model_args.cache_dir,
+#         config=config,
+#         token=data_args.token,
+#         trust_remote_code=data_args.trust_remote_code,
+#     )
+    #####
     model = AutoModelForCTC.from_pretrained(
         model_args.model_name_or_path,
         cache_dir=model_args.cache_dir,
         config=config,
         token=data_args.token,
         trust_remote_code=data_args.trust_remote_code,
+        ignore_mismatched_sizes=model_args.ignore_mismatched_sizes, # Add this line here
     )
+
+    #####
 
     # freeze encoder
     if model_args.freeze_feature_encoder:
